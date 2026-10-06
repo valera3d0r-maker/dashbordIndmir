@@ -86,6 +86,7 @@ a{color:var(--accent);}
 <header class="top">
   <h1 data-i18n="appTitle">Индийский мир — аналитика OZON</h1>
   <div style="display:flex;align-items:center;gap:12px">
+    <select id="periodSelect" style="background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12.5px"></select>
     <select id="langSelect" style="background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12.5px">
       <option value="ru">Русский</option>
       <option value="en">English</option>
@@ -412,6 +413,11 @@ const I18N = {
         tax_effRate:'{rate} от полной стоимости · {burden} от реализации',
         kpi_costKnownSub:'по {n} из {total} SKU с продажами',
     kpi_costGap:'не хватает по {sum} выручки',
+        period_all:'Все периоды (сумма)',
+    period_label:'Период',
+    period_replaced:'Отчёт того же типа за этот период уже был загружен — он заменён новым.',
+    period_allNote:'Показаны все загруженные периоды суммарно.',
+    period_keepRef:'Себестоимость и остатки сохраняются при загрузке новых отчётов — их заново загружать не нужно.',
     lang_label:'Язык'
   },
   en: {
@@ -555,6 +561,11 @@ const I18N = {
         tax_effRate:'{rate} of full value · {burden} of realization',
         kpi_costKnownSub:'for {n} of {total} SKUs with sales',
     kpi_costGap:'missing for {sum} of revenue',
+        period_all:'All periods (combined)',
+    period_label:'Period',
+    period_replaced:'A report of the same type for this period was already loaded — it has been replaced.',
+    period_allNote:'Showing all loaded periods combined.',
+    period_keepRef:'Cost prices and stock levels are kept when new reports are uploaded — no need to load them again.',
     lang_label:'Language'
   },
   hi: {
@@ -698,6 +709,11 @@ const I18N = {
         tax_effRate:'{rate} पूर्ण मूल्य का · {burden} बिक्री का',
         kpi_costKnownSub:'बिक्री वाले {total} में से {n} SKU के लिए',
     kpi_costGap:'{sum} राजस्व के लिए उपलब्ध नहीं',
+        period_all:'सभी अवधियाँ (कुल)',
+    period_label:'अवधि',
+    period_replaced:'इस अवधि की इसी प्रकार की रिपोर्ट पहले से लोड थी — उसे बदल दिया गया है।',
+    period_allNote:'सभी लोड की गई अवधियाँ कुल मिलाकर दिखाई गई हैं।',
+    period_keepRef:'नई रिपोर्ट अपलोड करने पर लागत मूल्य और स्टॉक बने रहते हैं — उन्हें दोबारा लोड करने की आवश्यकता नहीं।',
     lang_label:'भाषा'
   }
 };
@@ -725,6 +741,7 @@ function setLanguage(lang){
   try { localStorage.setItem(LS_LANG, lang); } catch(e){ /* storage may be unavailable */ }
   if (document.documentElement) document.documentElement.setAttribute('lang', lang);
   applyStaticI18n();
+  renderPeriodSelector();
   recomputeAndRenderAll();
   renderSourceList();
   renderSnapshotList();
@@ -754,7 +771,8 @@ const LS = {
   PLAN: 'ozon_dash_plan_v1',
   SNAPSHOTS: 'ozon_dash_snapshots_v1',
   THRESHOLDS: 'ozon_dash_thresholds_v1',
-  TAX: 'ozon_dash_tax_v1'
+  TAX: 'ozon_dash_tax_v1',
+  PERIOD: 'ozon_dash_period_v1'
 };
 const BUILD_TIME = new Date().toISOString();
 
@@ -1411,12 +1429,13 @@ async function handleFiles(fileList){
         if (detection.type === 'unknown' || !detection.result || !detection.result.ok) continue;
         matched = true;
         const period = extractPeriod(aoa);
-        applyParsedData(detection.type, detection.result.rows, file.name, sheetName, period);
+        const wasReplaced = applyParsedData(detection.type, detection.result.rows, file.name, sheetName, period);
         sheetSummaries.push({
           type: detection.type, sheetName, period,
           rows: detection.result.rows.length,
           missing: detection.result.missing,
-          fallback: detection.result.fallback
+          fallback: detection.result.fallback,
+          replaced: wasReplaced
         });
       }
       if (!matched){
@@ -1433,6 +1452,9 @@ async function handleFiles(fileList){
           if (s.fallback){
             msg += ' <span style="color:var(--yellow)">' + t('log_fallback') + '</span>';
           }
+          if (s.replaced){
+            msg += ' <span style="color:var(--yellow)">' + t('period_replaced') + '</span>';
+          }
           logUpload(file.name, msg, false);
         }
       }
@@ -1442,16 +1464,34 @@ async function handleFiles(fileList){
     }
   }
   persistState();
+  renderPeriodSelector();
   renderSourceList();
   recomputeAndRenderAll();
 }
 
 function applyParsedData(type, rows, fileName, sheetName, period){
-  // The first real upload clears the built-in August snapshot: keeping both would silently blend
-  // two different periods into one set of totals.
-  if (STATE.sources.some(s=>s.builtin)){
+  // The first real upload clears the built-in PERIOD reports so August does not silently blend into
+  // the month being loaded. Cost prices and stock levels are deliberately KEPT: they are reference
+  // data not tied to any period. (Wiping them was a bug — it left the dashboard with no cost
+  // coverage and no stock figures the moment a user uploaded their first report.)
+  if (STATE.sources.some(s=>s.builtin) && type !== 'cost' && type !== 'stock'){
     STATE.realization = []; STATE.expenses = []; STATE.acquiring = []; STATE.unitreport = [];
-    STATE.costFile = {}; STATE.stockFile = {}; STATE.sources = [];
+    STATE.sources = STATE.sources.filter(s=>s.type === 'cost' || s.type === 'stock');
+    // The surviving cost/stock sources must lose the built-in flag, otherwise the next upload would
+    // see it again and wipe the period reports a second time — clearing whatever was just loaded.
+    STATE.sources.forEach(s=>{ delete s.builtin; });
+  }
+  // Re-loading the same report type for the same period replaces the earlier copy rather than
+  // double-counting it — a corrected re-export of the same month is the common case.
+  let replaced = false;
+  const incomingKey = periodKeyOf({period: period});
+  if (incomingKey && ['realization','expenses','acquiring','unitreport'].indexOf(type) !== -1){
+    const doomed = STATE[type].filter(src=>periodKeyOf(src) === incomingKey).map(src=>src.sourceId);
+    if (doomed.length){
+      STATE[type] = STATE[type].filter(src=>doomed.indexOf(src.sourceId) === -1);
+      STATE.sources = STATE.sources.filter(s=>doomed.indexOf(s.id) === -1);
+      replaced = true;
+    }
   }
   const sourceId = fileName + '::' + sheetName + '::' + Date.now();
   if (type === 'realization'){
@@ -1474,6 +1514,7 @@ function applyParsedData(type, rows, fileName, sheetName, period){
     }
   }
   STATE.sources.push({id: sourceId, fileName, sheetName, type, period, rowsCount: rows.length, uploadedAt: new Date().toISOString()});
+  return replaced;
 }
 
 function renderSourceNotice(){
@@ -1510,8 +1551,9 @@ function removeSource(id){
   STATE.acquiring = STATE.acquiring.filter(x=>x.sourceId!==id);
   STATE.unitreport = STATE.unitreport.filter(x=>x.sourceId!==id);
   STATE.sources = STATE.sources.filter(x=>x.id!==id);
-  // cost/stock files are merged by artikul without per-source tracking of removal; note as limitation is out of scope here
+  // cost/stock files are merged by artikul without per-source tracking of removal
   persistState();
+  renderPeriodSelector();
   renderSourceList();
   recomputeAndRenderAll();
 }
@@ -1524,14 +1566,14 @@ function removeSource(id){
 // fee is counted in the catalogue total but reported as unattributed, never silently dropped.
 function buildSkuToArtikulMap(){
   const map = {};
-  for (const src of STATE.realization){
+  for (const src of scoped(STATE.realization)){
     for (const r of src.rows){
       if (r.sku !== undefined && r.sku !== null && String(r.sku).trim() !== ''){
         map[String(r.sku).trim()] = r.artikul;
       }
     }
   }
-  for (const src of STATE.expenses){
+  for (const src of scoped(STATE.expenses)){
     for (const r of src.rows){
       if (r.sku !== undefined && r.sku !== null && String(r.sku).trim() !== ''){
         if (!map[String(r.sku).trim()]) map[String(r.sku).trim()] = r.artikul;
@@ -1546,7 +1588,7 @@ function buildAcquiringByArtikul(){
   const skuMap = buildSkuToArtikulMap();
   const byArtikul = {};
   let unattributedAmount = 0, unattributedRows = 0, totalAmount = 0;
-  for (const src of STATE.acquiring){
+  for (const src of scoped(STATE.acquiring)){
     for (const r of src.rows){
       totalAmount += r.amount;
       const artikul = skuMap[String(r.sku).trim()];
@@ -1556,15 +1598,46 @@ function buildAcquiringByArtikul(){
       byArtikul[artikul] += r.amount;
     }
   }
-  return {byArtikul, unattributedAmount, unattributedRows, totalAmount, hasData: STATE.acquiring.length > 0};
+  return {byArtikul, unattributedAmount, unattributedRows, totalAmount, hasData: scoped(STATE.acquiring).length > 0};
 }
+
+// ---- PERIODS ----
+// Each loaded report keeps the period parsed from the file ("01.08.2026 — 31.08.2026"), so several
+// months can live side by side and the selector decides whether one month or all of them is shown.
+// Cost prices and stock levels are NOT period-scoped: a cost price and a current stock level apply
+// to whatever month is on screen, so they are always in scope.
+let SELECTED_PERIOD = 'all';
+
+function periodKeyOf(src){
+  if (!src || !src.period) return null;
+  const m = String(src.period).match(/(\d{2})\.(\d{2})\.(\d{4})/);
+  return m ? (m[3] + '-' + m[2]) : null;
+}
+function listPeriods(){
+  const keys = [];
+  for (const bucket of [STATE.realization, STATE.expenses, STATE.acquiring, STATE.unitreport]){
+    for (const src of bucket){
+      const k = periodKeyOf(src);
+      if (k && keys.indexOf(k) === -1) keys.push(k);
+    }
+  }
+  return keys.sort();
+}
+// In scope when "all" is chosen, when the period matches, or when the source carries no period at
+// all — the latter cannot be attributed to a month and would otherwise disappear without warning.
+function srcInScope(src){
+  if (SELECTED_PERIOD === 'all') return true;
+  const k = periodKeyOf(src);
+  return k === null || k === SELECTED_PERIOD;
+}
+function scoped(bucket){ return bucket.filter(srcInScope); }
 
 // Advertising / storage / misc-service totals per артикул, from the "Юнит-экономика" export.
 // hasData distinguishes "report not loaded" (null → показывать «нет данных») from "loaded, but this
 // product had no such charges" (real 0).
 function buildUnitReportByArtikul(){
   const by = {};
-  for (const src of STATE.unitreport){
+  for (const src of scoped(STATE.unitreport)){
     for (const r of src.rows){
       if (!by[r.artikul]) by[r.artikul] = {adSpend:[], storage:[], otherServices:[], ordered:[], delivered:[], returnedUnits:[]};
       const b = by[r.artikul];
@@ -1580,7 +1653,7 @@ function buildUnitReportByArtikul(){
       ordered: sumDefined(b.ordered), delivered: sumDefined(b.delivered), returnedUnits: sumDefined(b.returnedUnits)
     };
   }
-  return {byArtikul: out, hasData: STATE.unitreport.length > 0};
+  return {byArtikul: out, hasData: scoped(STATE.unitreport).length > 0};
 }
 
 function buildSkuAggregates(){
@@ -1599,7 +1672,7 @@ function buildSkuAggregates(){
     return map[artikul];
   }
 
-  for (const src of STATE.realization){
+  for (const src of scoped(STATE.realization)){
     for (const r of src.rows){
       const agg = ensure(r.artikul, r.name);
       agg.realizedSumArr.push(r.realizedSum);
@@ -1608,10 +1681,10 @@ function buildSkuAggregates(){
       agg.returnedQtyArr.push(r.returnedQty);
     }
   }
-  for (const src of STATE.unitreport){
+  for (const src of scoped(STATE.unitreport)){
     for (const r of src.rows){ ensure(r.artikul, r.name); }
   }
-  for (const src of STATE.expenses){
+  for (const src of scoped(STATE.expenses)){
     for (const r of src.rows){
       const agg = ensure(r.artikul, r.name);
       agg.commissionSumArr.push(r.commissionSum);
@@ -1904,7 +1977,7 @@ function calcDailyVelocity(item){
   return item.qty / periodDays;
 }
 function getRealizationPeriodDays(){
-  for (const src of STATE.realization){
+  for (const src of scoped(STATE.realization)){
     if (src.period){
       const m = src.period.match(/(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2})\.(\d{2})\.(\d{4})/);
       if (m){
@@ -2258,7 +2331,7 @@ function renderTaxBlock(tot){
 }
 
 function getRealizationMonthLabel(){
-  for (const src of STATE.realization){
+  for (const src of scoped(STATE.realization)){
     if (src.period){
       const m = src.period.match(/\d{2}\.(\d{2})\.(\d{4})/);
       if (m) return m[2]+'-'+m[1];
@@ -2463,7 +2536,7 @@ function median(arr){
   return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
 }
 function renderAdsTab(items, tot){
-  const hasUnit = STATE.unitreport.length > 0;
+  const hasUnit = scoped(STATE.unitreport).length > 0;
   document.getElementById('adsUnavailable').innerHTML = hasUnit ? '' :
     '<div class="card"><div class="tag-warn">' + t('ads_unavailable') + '</div></div>';
 
@@ -2742,6 +2815,34 @@ function initTaxControls(){
   });
 }
 
+// Rebuilds the period dropdown from whatever is loaded. Shown only when more than one month exists,
+// so a single-month setup is not cluttered by a control with one option.
+function renderPeriodSelector(){
+  const sel = document.getElementById('periodSelect');
+  if (!sel) return;
+  const periods = listPeriods();
+  if (periods.length < 2){ sel.style.display = 'none'; SELECTED_PERIOD = 'all'; return; }
+  sel.style.display = '';
+  if (SELECTED_PERIOD !== 'all' && periods.indexOf(SELECTED_PERIOD) === -1) SELECTED_PERIOD = 'all';
+  const monthLabel = key => {
+    const [y,m] = key.split('-');
+    return new Date(+y, +m-1, 1).toLocaleDateString(currentLocale(), {month:'long', year:'numeric'});
+  };
+  sel.innerHTML = '<option value="all">'+esc(t('period_all'))+'</option>' +
+    periods.map(k=>'<option value="'+esc(k)+'">'+esc(monthLabel(k))+'</option>').join('');
+  sel.value = SELECTED_PERIOD;
+}
+function initPeriodControls(){
+  const sel = document.getElementById('periodSelect');
+  if (!sel) return;
+  sel.addEventListener('change', ()=>{
+    SELECTED_PERIOD = sel.value;
+    try { localStorage.setItem(LS.PERIOD, SELECTED_PERIOD); } catch(e){ /* storage may be unavailable */ }
+    recomputeAndRenderAll();
+    renderSourceList();
+  });
+}
+
 function initThresholdControls(){
   document.getElementById('btnSaveThr').addEventListener('click', ()=>{
     const critical = parseInt(document.getElementById('thrCritical').value) || 7;
@@ -2776,12 +2877,15 @@ function init(){
   }
   applyStaticI18n();
   loadFromStorage();
+  try { SELECTED_PERIOD = localStorage.getItem(LS.PERIOD) || 'all'; } catch(e){ SELECTED_PERIOD = 'all'; }
+  renderPeriodSelector();
   initTabs();
   initUpload();
   initSnapshots();
   initPlanFactControls();
   initThresholdControls();
   initTaxControls();
+  initPeriodControls();
   initUnitControls();
   initProductsControls();
   initBuildTag();
